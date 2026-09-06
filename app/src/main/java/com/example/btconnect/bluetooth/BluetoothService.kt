@@ -154,7 +154,7 @@ object BluetoothService {
         serverThread = AcceptThread().also { it.start() }
     }
 
-    private inner class AcceptThread : Thread() {
+    private class AcceptThread : Thread() {
         private var serverSocket: BluetoothServerSocket? = null
 
         @SuppressLint("MissingPermission")
@@ -206,7 +206,7 @@ object BluetoothService {
         ConnectThread(target.device, target.name).start()
     }
 
-    private inner class ConnectThread(
+    private class ConnectThread(
         private val device: BluetoothDevice,
         private val peerName: String
     ) : Thread() {
@@ -342,7 +342,7 @@ object BluetoothService {
     // The single active connection: reads frames and dispatches them
     // ---------------------------------------------------------------------
 
-    private inner class ConnectedThread(
+    private class ConnectedThread(
         private val socket: BluetoothSocket,
         private val isInitiator: Boolean,
         initialPeerName: String? = null

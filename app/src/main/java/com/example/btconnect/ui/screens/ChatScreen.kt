@@ -70,7 +70,7 @@ fun ChatScreen(
         bottomBar = {
             Column {
                 fileProgress?.let {
-                    LinearProgressIndicator(progress = { it }, modifier = Modifier.fillMaxWidth())
+                    LinearProgressIndicator(progress = it, modifier = Modifier.fillMaxWidth())
                 }
                 Surface(tonalElevation = 3.dp) {
                     Row(

@@ -10,6 +10,8 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.graphics.BitmapFactory
+import androidx.core.content.ContextCompat
+import androidx.core.content.IntentCompat
 import com.example.btconnect.model.ChatMessage
 import com.example.btconnect.model.DeviceInfo
 import com.example.btconnect.model.MessageKind
@@ -82,7 +84,7 @@ object BluetoothService {
         override fun onReceive(context: Context, intent: Intent) {
             when (intent.action) {
                 BluetoothDevice.ACTION_FOUND -> {
-                    val device = intent.getParcelableExtra<BluetoothDevice>(BluetoothDevice.EXTRA_DEVICE)
+                    val device = IntentCompat.getParcelableExtra(intent, BluetoothDevice.EXTRA_DEVICE, BluetoothDevice::class.java)
                         ?: return
                     val info = DeviceInfo(
                         name = device.name ?: "Unknown device",
@@ -110,7 +112,7 @@ object BluetoothService {
             addAction(BluetoothDevice.ACTION_FOUND)
             addAction(BluetoothAdapter.ACTION_DISCOVERY_FINISHED)
         }
-        appContext!!.registerReceiver(discoveryReceiver, filter)
+        ContextCompat.registerReceiver(appContext!!, discoveryReceiver, filter, ContextCompat.RECEIVER_EXPORTED)
         startServer()
     }
 

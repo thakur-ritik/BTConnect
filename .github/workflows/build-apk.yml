@@ -8,6 +8,8 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
@@ -27,17 +29,30 @@ jobs:
           set -o pipefail
           gradle assembleDebug --stacktrace --no-daemon 2>&1 | tee build.log
 
-      - name: Post build log to summary
+      - name: Push build log to branch
         if: always()
         run: |
-          echo "### Gradle Build Log (tail 250)" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          tail -n 250 build.log >> $GITHUB_STEP_SUMMARY 2>/dev/null || true
-          echo '```' >> $GITHUB_STEP_SUMMARY
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git checkout -B build-log
+          cp build.log build-log.txt 2>/dev/null || echo "No build.log" > build-log.txt
+          git add build-log.txt
+          git commit -m "Upload build log [skip ci]" || true
+          git push -f origin build-log || true
 
-      - name: Upload APK
+      - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: BTConnect-debug-apk
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
+
+      - name: Release APK
+        if: success()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0-debug
+          name: BTConnect Debug APK
+          files: app/build/outputs/apk/debug/app-debug.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

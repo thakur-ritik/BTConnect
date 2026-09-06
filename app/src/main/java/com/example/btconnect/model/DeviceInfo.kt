@@ -10,5 +10,6 @@ data class DeviceInfo(
     val name: String,
     val address: String,
     val device: BluetoothDevice,
-    val bonded: Boolean = false
+    val bonded: Boolean = false,
+    val majorClass: Int = 0
 )

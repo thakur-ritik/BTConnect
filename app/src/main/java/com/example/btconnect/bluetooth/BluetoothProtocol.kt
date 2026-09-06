@@ -13,8 +13,9 @@ import java.util.UUID
  */
 object BluetoothProtocol {
 
-    // A fixed, app-specific UUID both sides use to find the right RFCOMM channel.
+    // App-specific UUIDs both sides use to find the RFCOMM channel.
     val APP_UUID: UUID = UUID.fromString("8ce255c0-200a-11e0-ac64-0800200c9a66")
+    val INSECURE_APP_UUID: UUID = UUID.fromString("fa87c0d0-afac-11de-8a39-0800200c9a66")
 
     const val TYPE_CONNECT_REQUEST: Int = 1
     const val TYPE_CONNECT_ACCEPT: Int = 2
@@ -32,6 +33,8 @@ object BluetoothProtocol {
     const val TYPE_CALL_END: Int = 11
 
     const val TYPE_AUDIO_CHUNK: Int = 12
+    const val TYPE_VOICE_NOTE: Int = 13
+    const val TYPE_DISCONNECT: Int = 14
 
     /**
      * Thread-safe frame write. Synchronized so chat / file / audio threads can share one socket.

@@ -3,16 +3,20 @@ package com.example.btconnect
 import android.Manifest
 import android.bluetooth.BluetoothAdapter
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.database.Cursor
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.media.AudioManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.OpenableColumns
+import android.widget.Toast
 import androidx.activity.ComponentActivity
-import androidx.activity.compose.setContent
 import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
 import androidx.compose.material3.*
@@ -20,6 +24,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import androidx.core.content.FileProvider
 import com.example.btconnect.bluetooth.AudioCallManager
 import com.example.btconnect.bluetooth.BluetoothService
 import com.example.btconnect.bluetooth.CallState
@@ -29,23 +34,26 @@ import com.example.btconnect.ui.screens.CallScreenMode
 import com.example.btconnect.ui.screens.ChatScreen
 import com.example.btconnect.ui.screens.DeviceListScreen
 import com.example.btconnect.ui.theme.BTConnectTheme
+import java.io.File
+import java.io.FileOutputStream
 
 class MainActivity : ComponentActivity() {
 
     private fun requiredPermissions(): Array<String> {
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            arrayOf(
-                Manifest.permission.BLUETOOTH_SCAN,
-                Manifest.permission.BLUETOOTH_CONNECT,
-                Manifest.permission.BLUETOOTH_ADVERTISE,
-                Manifest.permission.RECORD_AUDIO
-            )
+        val perms = mutableListOf<String>()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            perms.add(Manifest.permission.BLUETOOTH_SCAN)
+            perms.add(Manifest.permission.BLUETOOTH_CONNECT)
+            perms.add(Manifest.permission.BLUETOOTH_ADVERTISE)
         } else {
-            arrayOf(
-                Manifest.permission.ACCESS_FINE_LOCATION,
-                Manifest.permission.RECORD_AUDIO
-            )
+            perms.add(Manifest.permission.ACCESS_FINE_LOCATION)
+            perms.add(Manifest.permission.ACCESS_COARSE_LOCATION)
         }
+        perms.add(Manifest.permission.RECORD_AUDIO)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            perms.add(Manifest.permission.POST_NOTIFICATIONS)
+        }
+        return perms.toTypedArray()
     }
 
     private fun hasAllPermissions(): Boolean =
@@ -68,7 +76,7 @@ class MainActivity : ComponentActivity() {
 
                 val enableBtLauncher = rememberLauncherForActivityResult(
                     ActivityResultContracts.StartActivityForResult()
-                ) { /* result ignored; UI just re-reads adapter state */ }
+                ) { /* result handled by state check */ }
 
                 LaunchedEffect(Unit) {
                     if (!permissionsGranted) permissionLauncher.launch(requiredPermissions())
@@ -79,7 +87,7 @@ class MainActivity : ComponentActivity() {
                         PermissionGate(onGrantClick = { permissionLauncher.launch(requiredPermissions()) })
                     } else if (!BluetoothService.isBluetoothEnabled()) {
                         BluetoothOffGate(onEnableClick = {
-                            enableBtLauncher.launch(android.content.Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE))
+                            enableBtLauncher.launch(Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE))
                         })
                     } else {
                         AppContent()
@@ -93,31 +101,47 @@ class MainActivity : ComponentActivity() {
 @Composable
 private fun PermissionGate(onGrantClick: () -> Unit) {
     Column(
-        Modifier.fillMaxSize().padding(32.dp),
+        Modifier
+            .fillMaxSize()
+            .padding(32.dp),
         horizontalAlignment = androidx.compose.ui.Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center
     ) {
-        Text("BTConnect needs Bluetooth and microphone permissions to find nearby devices and make calls.", textAlign = androidx.compose.ui.text.style.TextAlign.Center)
-        Spacer(Modifier.height(16.dp))
-        Button(onClick = onGrantClick) { Text("Grant permissions") }
+        Text(
+            "BTConnect needs Bluetooth, Location, and Microphone permissions to discover nearby phones, chat, and make voice calls.",
+            textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+            style = MaterialTheme.typography.bodyLarge
+        )
+        Spacer(Modifier.height(20.dp))
+        Button(onClick = onGrantClick) {
+            Text("Grant Permissions")
+        }
     }
 }
 
 @Composable
 private fun BluetoothOffGate(onEnableClick: () -> Unit) {
     Column(
-        Modifier.fillMaxSize().padding(32.dp),
+        Modifier
+            .fillMaxSize()
+            .padding(32.dp),
         horizontalAlignment = androidx.compose.ui.Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center
     ) {
-        Text("Bluetooth is turned off.", textAlign = androidx.compose.ui.text.style.TextAlign.Center)
-        Spacer(Modifier.height(16.dp))
-        Button(onClick = onEnableClick) { Text("Turn on Bluetooth") }
+        Text(
+            "Bluetooth is turned off.\nPlease turn on Bluetooth to connect with nearby devices.",
+            textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+            style = MaterialTheme.typography.bodyLarge
+        )
+        Spacer(Modifier.height(20.dp))
+        Button(onClick = onEnableClick) {
+            Text("Turn On Bluetooth")
+        }
     }
 }
 
 private fun queryFileName(context: Context, uri: Uri): Pair<String, Long> {
-    var name = "file"
+    var name = "file_${System.currentTimeMillis()}"
     var size = 0L
     val cursor: Cursor? = context.contentResolver.query(uri, null, null, null, null)
     cursor?.use {
@@ -131,6 +155,25 @@ private fun queryFileName(context: Context, uri: Uri): Pair<String, Long> {
     return name to size
 }
 
+private fun openFile(context: Context, path: String, mimeType: String?) {
+    try {
+        val file = File(path)
+        if (!file.exists()) {
+            Toast.makeText(context, "File not found on device", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
+        val intent = Intent(Intent.ACTION_VIEW).apply {
+            setDataAndType(uri, mimeType ?: "*/*")
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        context.startActivity(Intent.createChooser(intent, "Open with"))
+    } catch (e: Exception) {
+        Toast.makeText(context, "No app available to open this file", Toast.LENGTH_SHORT).show()
+    }
+}
+
 @Composable
 private fun AppContent() {
     val context = LocalContext.current
@@ -140,21 +183,48 @@ private fun AppContent() {
     val fileProgress by BluetoothService.fileProgress.collectAsState()
     val discovered by BluetoothService.discoveredDevices.collectAsState()
     val isScanning by BluetoothService.isScanning.collectAsState()
+    val errorMessage by BluetoothService.errorMessage.collectAsState()
 
     var isMuted by remember { mutableStateOf(false) }
     var isSpeakerOn by remember { mutableStateOf(false) }
+
+    val discoverableLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { /* Activity result handled */ }
 
     val filePicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
         if (uri != null) {
             val (name, size) = queryFileName(context, uri)
             val mime = context.contentResolver.getType(uri) ?: "application/octet-stream"
-            context.contentResolver.openInputStream(uri)?.let { stream ->
-                BluetoothService.sendFile(stream, name, size, mime)
+            try {
+                val cacheDir = File(context.cacheDir, "sent_files").apply { mkdirs() }
+                val cacheFile = File(cacheDir, name)
+                context.contentResolver.openInputStream(uri)?.use { input ->
+                    FileOutputStream(cacheFile).use { output ->
+                        input.copyTo(output)
+                    }
+                }
+                var bitmap: Bitmap? = null
+                if (mime.startsWith("image/") && cacheFile.exists()) {
+                    bitmap = BitmapFactory.decodeFile(cacheFile.absolutePath)
+                }
+                cacheFile.inputStream().let { stream ->
+                    BluetoothService.sendFile(
+                        inputStream = stream,
+                        name = name,
+                        size = cacheFile.length(),
+                        mime = mime,
+                        localPath = cacheFile.absolutePath,
+                        localImage = bitmap
+                    )
+                }
+            } catch (e: Exception) {
+                Toast.makeText(context, "Error sending file: ${e.message}", Toast.LENGTH_SHORT).show()
             }
         }
     }
 
-    // Start/stop the audio pipeline whenever a call becomes active/inactive.
+    // Start/stop audio VoIP engine during active call
     LaunchedEffect(callState) {
         val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
         if (callState is CallState.InCall) {
@@ -166,17 +236,21 @@ private fun AppContent() {
         }
     }
 
-    // Incoming connection request dialog.
+    // Incoming connection request dialog
     (connectionState as? ConnectionState.AwaitingApproval)?.let { state ->
         AlertDialog(
             onDismissRequest = { },
-            title = { Text("Connection request") },
-            text = { Text("${state.peerName} wants to connect with you over Bluetooth.") },
+            title = { Text("Connection Request") },
+            text = { Text("${state.peerName} wants to connect with you via Bluetooth.") },
             confirmButton = {
-                TextButton(onClick = { BluetoothService.approveIncomingConnection() }) { Text("Accept") }
+                Button(onClick = { BluetoothService.approveIncomingConnection() }) {
+                    Text("Accept")
+                }
             },
             dismissButton = {
-                TextButton(onClick = { BluetoothService.rejectIncomingConnection() }) { Text("Decline") }
+                OutlinedButton(onClick = { BluetoothService.rejectIncomingConnection() }) {
+                    Text("Decline")
+                }
             }
         )
     }
@@ -185,53 +259,81 @@ private fun AppContent() {
         is ConnectionState.Connected -> {
             ChatScreen(
                 peerName = state.peerName,
+                peerAddress = state.peerAddress,
                 messages = messages,
                 fileProgress = fileProgress,
                 onBack = { BluetoothService.disconnect() },
                 onCallClick = { BluetoothService.startCall() },
                 onAttachClick = { filePicker.launch("*/*") },
-                onSend = { BluetoothService.sendText(it) }
+                onSendText = { BluetoothService.sendText(it) },
+                onSendVoiceNote = { file, durationMs -> BluetoothService.sendVoiceNote(file, durationMs) },
+                onOpenFile = { path, mime -> openFile(context, path, mime) },
+                onClearChat = { BluetoothService.clearMessages() },
+                onReconnect = { BluetoothService.reconnect() }
             )
         }
         else -> {
             val statusText = when (state) {
                 is ConnectionState.Connecting -> "Connecting to ${state.peerName}…"
-                is ConnectionState.AwaitingApproval -> "Incoming request from ${state.peerName}"
+                is ConnectionState.AwaitingApproval -> "Waiting for ${state.peerName}…"
                 else -> null
             }
             DeviceListScreen(
+                myDeviceName = BluetoothService.getDeviceName(),
                 pairedDevices = BluetoothService.pairedDevices(),
                 nearbyDevices = discovered,
                 isScanning = isScanning,
                 connectionStatusText = statusText,
+                errorMessage = errorMessage,
                 onScanClick = { BluetoothService.startDiscovery() },
-                onDeviceClick = { BluetoothService.requestConnection(it) }
+                onMakeDiscoverableClick = {
+                    val intent = Intent(BluetoothAdapter.ACTION_REQUEST_DISCOVERABLE).apply {
+                        putExtra(BluetoothAdapter.EXTRA_DISCOVERABLE_DURATION, 300)
+                    }
+                    discoverableLauncher.launch(intent)
+                },
+                onDeviceClick = { BluetoothService.requestConnection(it) },
+                onDismissError = { BluetoothService.clearError() }
             )
         }
     }
 
-    // Call UI floats above whatever screen is currently showing.
+    // Full-screen overlay for active/incoming/outgoing calls
     when (val cs = callState) {
         is CallState.Incoming -> CallScreen(
-            peerName = cs.peerName, mode = CallScreenMode.INCOMING, isMuted = isMuted, isSpeakerOn = isSpeakerOn,
+            peerName = cs.peerName,
+            mode = CallScreenMode.INCOMING,
+            isMuted = isMuted,
+            isSpeakerOn = isSpeakerOn,
             callStartedAtMs = null,
             onAccept = { BluetoothService.acceptCall() },
             onReject = { BluetoothService.rejectCall() },
             onEndCall = { BluetoothService.endCall() },
-            onToggleMute = { }, onToggleSpeaker = { }
+            onToggleMute = { },
+            onToggleSpeaker = { }
         )
         is CallState.Outgoing -> CallScreen(
-            peerName = cs.peerName, mode = CallScreenMode.OUTGOING, isMuted = isMuted, isSpeakerOn = isSpeakerOn,
+            peerName = cs.peerName,
+            mode = CallScreenMode.OUTGOING,
+            isMuted = isMuted,
+            isSpeakerOn = isSpeakerOn,
             callStartedAtMs = null,
-            onAccept = { }, onReject = { }, onEndCall = { BluetoothService.endCall() },
-            onToggleMute = { }, onToggleSpeaker = { }
+            onAccept = { },
+            onReject = { },
+            onEndCall = { BluetoothService.endCall() },
+            onToggleMute = { },
+            onToggleSpeaker = { }
         )
         is CallState.InCall -> {
             val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
             CallScreen(
-                peerName = cs.peerName, mode = CallScreenMode.IN_CALL, isMuted = isMuted, isSpeakerOn = isSpeakerOn,
+                peerName = cs.peerName,
+                mode = CallScreenMode.IN_CALL,
+                isMuted = isMuted,
+                isSpeakerOn = isSpeakerOn,
                 callStartedAtMs = cs.startedAtMs,
-                onAccept = { }, onReject = { },
+                onAccept = { },
+                onReject = { },
                 onEndCall = { BluetoothService.endCall() },
                 onToggleMute = {
                     isMuted = !isMuted

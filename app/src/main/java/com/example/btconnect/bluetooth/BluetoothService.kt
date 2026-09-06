@@ -29,9 +29,10 @@ import java.io.InputStream
 
 sealed class ConnectionState {
     data object Idle : ConnectionState()
-    data class Connecting(val peerName: String) : ConnectionState()
-    data class AwaitingApproval(val peerName: String) : ConnectionState() // we are the acceptor
+    data class Connecting(val peerName: String, val peerAddress: String = "") : ConnectionState()
+    data class AwaitingApproval(val peerName: String, val peerAddress: String = "") : ConnectionState()
     data class Connected(val peerName: String, val peerAddress: String) : ConnectionState()
+    data class Error(val message: String) : ConnectionState()
 }
 
 sealed class CallState {
@@ -42,10 +43,8 @@ sealed class CallState {
 }
 
 /**
- * Singleton that owns the Bluetooth adapter, device discovery, the single
- * active RFCOMM connection, and everything sent over it (chat text, files,
- * call signaling, live call audio). Call [init] once with an Application
- * context before use.
+ * Singleton managing Bluetooth state, discovery, dual secure/insecure RFCOMM sockets,
+ * chat messages, voice notes, file transfers, and voice calls.
  */
 object BluetoothService {
 
@@ -70,13 +69,19 @@ object BluetoothService {
     private val _fileProgress = MutableStateFlow<Float?>(null)
     val fileProgress: StateFlow<Float?> = _fileProgress.asStateFlow()
 
-    /** Invoked on the IO thread whenever a live audio chunk arrives during a call. */
+    private val _errorMessage = MutableStateFlow<String?>(null)
+    val errorMessage: StateFlow<String?> = _errorMessage.asStateFlow()
+
+    var lastTargetDevice: DeviceInfo? = null
+        private set
+
+    /** Invoked whenever a live audio chunk arrives during a call. */
     var onAudioChunkReceived: ((ByteArray) -> Unit)? = null
 
-    private var serverThread: AcceptThread? = null
+    private var secureServerThread: AcceptThread? = null
+    private var insecureServerThread: AcceptThread? = null
     private var connectedThread: ConnectedThread? = null
-    private var pendingIncomingThread: ConnectedThread? = null // held while AwaitingApproval
-
+    private var pendingIncomingThread: ConnectedThread? = null
     private var pendingFile: PendingFile? = null
 
     private val discoveryReceiver = object : BroadcastReceiver() {
@@ -86,15 +91,20 @@ object BluetoothService {
                 BluetoothDevice.ACTION_FOUND -> {
                     val device = IntentCompat.getParcelableExtra(intent, BluetoothDevice.EXTRA_DEVICE, BluetoothDevice::class.java)
                         ?: return
+                    val majorClass = try { device.bluetoothClass?.majorDeviceClass ?: 0 } catch (e: Exception) { 0 }
                     val info = DeviceInfo(
-                        name = device.name ?: "Unknown device",
+                        name = device.name ?: "Unknown Device",
                         address = device.address,
                         device = device,
-                        bonded = device.bondState == BluetoothDevice.BOND_BONDED
+                        bonded = device.bondState == BluetoothDevice.BOND_BONDED,
+                        majorClass = majorClass
                     )
                     _discoveredDevices.update { list ->
-                        if (list.any { it.address == info.address }) list
-                        else list + info
+                        if (list.any { it.address == info.address }) {
+                            list.map { if (it.address == info.address) info else it }
+                        } else {
+                            list + info
+                        }
                     }
                 }
                 BluetoothAdapter.ACTION_DISCOVERY_FINISHED -> {
@@ -113,17 +123,26 @@ object BluetoothService {
             addAction(BluetoothAdapter.ACTION_DISCOVERY_FINISHED)
         }
         ContextCompat.registerReceiver(appContext!!, discoveryReceiver, filter, ContextCompat.RECEIVER_EXPORTED)
-        startServer()
+        startServers()
     }
 
     fun isBluetoothEnabled(): Boolean = adapter?.isEnabled == true
+
+    fun getDeviceName(): String {
+        return try {
+            adapter?.name ?: "My Phone"
+        } catch (e: SecurityException) {
+            "My Phone"
+        }
+    }
 
     @SuppressLint("MissingPermission")
     fun pairedDevices(): List<DeviceInfo> {
         val a = adapter ?: return emptyList()
         return try {
             a.bondedDevices.map {
-                DeviceInfo(name = it.name ?: "Unknown device", address = it.address, device = it, bonded = true)
+                val major = try { it.bluetoothClass?.majorDeviceClass ?: 0 } catch (e: Exception) { 0 }
+                DeviceInfo(name = it.name ?: "Paired Device", address = it.address, device = it, bonded = true, majorClass = major)
             }
         } catch (e: SecurityException) {
             emptyList()
@@ -134,7 +153,9 @@ object BluetoothService {
     fun startDiscovery() {
         val a = adapter ?: return
         _discoveredDevices.value = emptyList()
-        if (a.isDiscovering) a.cancelDiscovery()
+        if (a.isDiscovering) {
+            a.cancelDiscovery()
+        }
         _isScanning.value = a.startDiscovery()
     }
 
@@ -145,36 +166,44 @@ object BluetoothService {
     }
 
     // ---------------------------------------------------------------------
-    // Server side: always listening so nearby devices can send us a request
+    // Dual Servers: Secure + Insecure listening
     // ---------------------------------------------------------------------
 
     @SuppressLint("MissingPermission")
-    private fun startServer() {
-        serverThread?.cancel()
-        serverThread = AcceptThread().also { it.start() }
+    private fun startServers() {
+        secureServerThread?.cancel()
+        insecureServerThread?.cancel()
+
+        secureServerThread = AcceptThread(isInsecure = false).also { it.start() }
+        insecureServerThread = AcceptThread(isInsecure = true).also { it.start() }
     }
 
-    private class AcceptThread : Thread() {
+    private class AcceptThread(private val isInsecure: Boolean) : Thread() {
         private var serverSocket: BluetoothServerSocket? = null
+        @Volatile private var running = true
 
         @SuppressLint("MissingPermission")
         override fun run() {
-            while (true) {
+            while (running) {
                 serverSocket = try {
-                    adapter?.listenUsingRfcommWithServiceRecord("BTConnect", BluetoothProtocol.APP_UUID)
+                    if (isInsecure) {
+                        adapter?.listenUsingInsecureRfcommWithServiceRecord("BTConnectInsecure", BluetoothProtocol.INSECURE_APP_UUID)
+                    } else {
+                        adapter?.listenUsingRfcommWithServiceRecord("BTConnect", BluetoothProtocol.APP_UUID)
+                    }
                 } catch (e: IOException) {
                     null
                 }
+
                 val socket = try {
                     serverSocket?.accept()
                 } catch (e: IOException) {
                     null
                 } ?: continue
 
-                serverSocket?.close()
+                try { serverSocket?.close() } catch (e: IOException) {}
 
-                // Only accept a new incoming request if we're not already busy.
-                if (_connectionState.value !is ConnectionState.Idle) {
+                if (_connectionState.value !is ConnectionState.Idle && _connectionState.value !is ConnectionState.Error) {
                     try { socket.close() } catch (e: IOException) {}
                     continue
                 }
@@ -183,6 +212,7 @@ object BluetoothService {
         }
 
         fun cancel() {
+            running = false
             try { serverSocket?.close() } catch (e: IOException) {}
         }
     }
@@ -195,46 +225,78 @@ object BluetoothService {
     }
 
     // ---------------------------------------------------------------------
-    // Client side: user picked a device from the list and wants to connect
+    // Client Connection: 3-Tier Fallback (Secure -> Insecure -> Channel Reflection)
     // ---------------------------------------------------------------------
 
     @SuppressLint("MissingPermission")
     fun requestConnection(target: DeviceInfo) {
-        if (_connectionState.value !is ConnectionState.Idle) return
+        lastTargetDevice = target
+        _errorMessage.value = null
         stopDiscovery()
-        _connectionState.value = ConnectionState.Connecting(target.name)
-        ConnectThread(target.device, target.name).start()
+        _connectionState.value = ConnectionState.Connecting(target.name, target.address)
+        ConnectThread(target.device, target.name, target.address).start()
+    }
+
+    fun reconnect() {
+        lastTargetDevice?.let { requestConnection(it) }
     }
 
     private class ConnectThread(
         private val device: BluetoothDevice,
-        private val peerName: String
+        private val peerName: String,
+        private val peerAddress: String
     ) : Thread() {
         @SuppressLint("MissingPermission")
         override fun run() {
-            val socket = try {
-                device.createRfcommSocketToServiceRecord(BluetoothProtocol.APP_UUID)
-            } catch (e: IOException) {
-                null
-            }
-            if (socket == null) {
-                _connectionState.value = ConnectionState.Idle
-                return
-            }
+            adapter?.cancelDiscovery()
+            var socket: BluetoothSocket? = null
+
+            // Tier 1: Try Secure RFCOMM
             try {
+                socket = device.createRfcommSocketToServiceRecord(BluetoothProtocol.APP_UUID)
                 socket.connect()
-            } catch (e: IOException) {
-                try { socket.close() } catch (e2: IOException) {}
-                _connectionState.value = ConnectionState.Idle
+            } catch (e: Exception) {
+                try { socket?.close() } catch (ex: Exception) {}
+                socket = null
+            }
+
+            // Tier 2: Try Insecure RFCOMM Fallback
+            if (socket == null) {
+                try {
+                    socket = device.createInsecureRfcommSocketToServiceRecord(BluetoothProtocol.INSECURE_APP_UUID)
+                    socket.connect()
+                } catch (e: Exception) {
+                    try { socket?.close() } catch (ex: Exception) {}
+                    socket = null
+                }
+            }
+
+            // Tier 3: Try Channel 1 Reflection Fallback (Standard SPP fallback for problematic OEMs)
+            if (socket == null) {
+                try {
+                    val m = device.javaClass.getMethod("createRfcommSocket", Int::class.javaPrimitiveType)
+                    socket = m.invoke(device, 1) as BluetoothSocket
+                    socket.connect()
+                } catch (e: Exception) {
+                    try { socket?.close() } catch (ex: Exception) {}
+                    socket = null
+                }
+            }
+
+            if (socket == null) {
+                val err = "Could not connect to $peerName. Make sure BTConnect is open on both devices and discoverable."
+                _errorMessage.value = err
+                _connectionState.value = ConnectionState.Error(err)
                 return
             }
-            val thread = ConnectedThread(socket, isInitiator = true, initialPeerName = peerName)
+
+            val thread = ConnectedThread(socket, isInitiator = true, initialPeerName = peerName, initialPeerAddress = peerAddress)
             thread.start()
         }
     }
 
     // ---------------------------------------------------------------------
-    // Approve / reject an incoming connection request from the UI
+    // Approve / Reject Incoming Connection
     // ---------------------------------------------------------------------
 
     fun approveIncomingConnection() {
@@ -253,15 +315,30 @@ object BluetoothService {
     }
 
     fun disconnect() {
+        try { connectedThread?.sendFrame(BluetoothProtocol.TYPE_DISCONNECT, ByteArray(0)) } catch (e: Exception) {}
         connectedThread?.close()
         connectedThread = null
+        pendingIncomingThread?.close()
+        pendingIncomingThread = null
         _connectionState.value = ConnectionState.Idle
         _callState.value = CallState.Idle
+    }
+
+    fun clearMessages() {
         _messages.value = emptyList()
     }
 
+    fun clearError() {
+        _errorMessage.value = null
+        if (_connectionState.value is ConnectionState.Error) {
+            _connectionState.value = ConnectionState.Idle
+        }
+    }
+
+    fun resetError() = clearError()
+
     // ---------------------------------------------------------------------
-    // Chat + file sending
+    // Messaging, Files & Voice Notes
     // ---------------------------------------------------------------------
 
     fun sendText(text: String) {
@@ -270,13 +347,19 @@ object BluetoothService {
         _messages.update { it + ChatMessage(isMine = true, kind = MessageKind.TEXT, text = text) }
     }
 
-    /** Streams a file (e.g. picked from the gallery) to the connected peer in chunks. */
-    fun sendFile(inputStream: InputStream, name: String, size: Long, mime: String) {
+    fun sendFile(
+        inputStream: InputStream,
+        name: String,
+        size: Long,
+        mime: String,
+        localPath: String? = null,
+        localImage: Bitmap? = null
+    ) {
         val thread = connectedThread ?: return
         Thread {
             try {
                 _fileProgress.value = 0f
-                thread.sendFrame(BluetoothProtocol.TYPE_FILE_META, "$name|$size|$mime")
+                thread.sendFrame(BluetoothProtocol.TYPE_FILE_META, "$name|$size|$mime|0")
                 val buffer = ByteArray(8192)
                 var sent = 0L
                 inputStream.use { stream ->
@@ -295,12 +378,50 @@ object BluetoothService {
                     it + ChatMessage(
                         isMine = true,
                         kind = if (isImage) MessageKind.IMAGE else MessageKind.FILE,
+                        image = localImage,
                         fileName = name,
-                        fileSize = size
+                        fileSize = size,
+                        filePath = localPath,
+                        mimeType = mime
                     )
                 }
             } catch (e: Exception) {
-                // Transfer failed (e.g. disconnected mid-send) - nothing more to do.
+            } finally {
+                _fileProgress.value = null
+            }
+        }.start()
+    }
+
+    fun sendVoiceNote(file: File, durationMs: Long) {
+        val thread = connectedThread ?: return
+        Thread {
+            try {
+                _fileProgress.value = 0f
+                val name = file.name
+                val size = file.length()
+                thread.sendFrame(BluetoothProtocol.TYPE_FILE_META, "$name|$size|audio/mp4|$durationMs")
+                val buffer = ByteArray(8192)
+                file.inputStream().use { stream ->
+                    while (true) {
+                        val read = stream.read(buffer)
+                        if (read <= 0) break
+                        val chunk = if (read == buffer.size) buffer else buffer.copyOf(read)
+                        thread.sendFrame(BluetoothProtocol.TYPE_FILE_CHUNK, chunk)
+                    }
+                }
+                thread.sendFrame(BluetoothProtocol.TYPE_FILE_END, ByteArray(0))
+                _messages.update {
+                    it + ChatMessage(
+                        isMine = true,
+                        kind = MessageKind.VOICE_NOTE,
+                        fileName = name,
+                        fileSize = size,
+                        filePath = file.absolutePath,
+                        durationMs = durationMs,
+                        mimeType = "audio/mp4"
+                    )
+                }
+            } catch (e: Exception) {
             } finally {
                 _fileProgress.value = null
             }
@@ -308,7 +429,7 @@ object BluetoothService {
     }
 
     // ---------------------------------------------------------------------
-    // Call signaling
+    // Call Signaling
     // ---------------------------------------------------------------------
 
     fun startCall() {
@@ -320,16 +441,19 @@ object BluetoothService {
 
     fun acceptCall() {
         val state = _callState.value as? CallState.Incoming ?: return
+        AudioCallManager.stopRinging()
         connectedThread?.sendFrame(BluetoothProtocol.TYPE_CALL_ACCEPT, ByteArray(0))
         _callState.value = CallState.InCall(state.peerName, System.currentTimeMillis())
     }
 
     fun rejectCall() {
+        AudioCallManager.stopRinging()
         connectedThread?.sendFrame(BluetoothProtocol.TYPE_CALL_REJECT, ByteArray(0))
         _callState.value = CallState.Idle
     }
 
     fun endCall() {
+        AudioCallManager.stopRinging()
         connectedThread?.sendFrame(BluetoothProtocol.TYPE_CALL_END, ByteArray(0))
         _callState.value = CallState.Idle
     }
@@ -339,23 +463,25 @@ object BluetoothService {
     }
 
     // ---------------------------------------------------------------------
-    // The single active connection: reads frames and dispatches them
+    // Connected Socket Worker Thread
     // ---------------------------------------------------------------------
 
     private class ConnectedThread(
         private val socket: BluetoothSocket,
         private val isInitiator: Boolean,
-        initialPeerName: String? = null
-    ) : Thread() {
+        initialPeerName: String? = null,
+        initialPeerAddress: String? = null
+    ) : Thread("BTConnect-IOThread") {
         private val input = DataInputStream(socket.inputStream)
         private val output = DataOutputStream(socket.outputStream)
-        private var peerName: String = initialPeerName ?: "Unknown"
+        private var peerName: String = initialPeerName ?: "Nearby Device"
+        private var peerAddress: String = initialPeerAddress ?: (socket.remoteDevice?.address ?: "")
         @Volatile private var running = true
 
         @SuppressLint("MissingPermission")
         override fun run() {
             if (isInitiator) {
-                val myName = adapter?.name ?: "My phone"
+                val myName = adapter?.name ?: "Android Device"
                 BluetoothProtocol.writeFrame(output, BluetoothProtocol.TYPE_CONNECT_REQUEST, myName)
             }
 
@@ -368,6 +494,11 @@ object BluetoothService {
                 connectedThread = null
                 _connectionState.value = ConnectionState.Idle
                 _callState.value = CallState.Idle
+                AudioCallManager.stopRinging()
+            }
+            if (pendingIncomingThread === this) {
+                pendingIncomingThread = null
+                _connectionState.value = ConnectionState.Idle
             }
         }
 
@@ -375,17 +506,26 @@ object BluetoothService {
         private fun handleFrame(frame: BluetoothProtocol.Frame) {
             when (frame.type) {
                 BluetoothProtocol.TYPE_CONNECT_REQUEST -> {
-                    peerName = frame.text()
-                    _connectionState.value = ConnectionState.AwaitingApproval(peerName)
+                    peerName = frame.text().ifBlank { "Nearby Device" }
+                    peerAddress = socket.remoteDevice?.address ?: ""
+                    _connectionState.value = ConnectionState.AwaitingApproval(peerName, peerAddress)
                 }
                 BluetoothProtocol.TYPE_CONNECT_ACCEPT -> {
                     connectedThread = this
-                    val socketAddress = socket.remoteDevice?.address ?: ""
-                    _connectionState.value = ConnectionState.Connected(peerName, socketAddress)
+                    val address = socket.remoteDevice?.address ?: peerAddress
+                    _connectionState.value = ConnectionState.Connected(peerName, address)
                 }
                 BluetoothProtocol.TYPE_CONNECT_REJECT -> {
                     running = false
+                    val err = "$peerName declined the connection request."
+                    _errorMessage.value = err
+                    _connectionState.value = ConnectionState.Error(err)
+                }
+                BluetoothProtocol.TYPE_DISCONNECT -> {
+                    running = false
                     _connectionState.value = ConnectionState.Idle
+                    _callState.value = CallState.Idle
+                    AudioCallManager.stopRinging()
                 }
                 BluetoothProtocol.TYPE_TEXT -> {
                     _messages.update { it + ChatMessage(isMine = false, kind = MessageKind.TEXT, text = frame.text()) }
@@ -395,7 +535,8 @@ object BluetoothService {
                     val name = parts.getOrElse(0) { "file" }
                     val size = parts.getOrElse(1) { "0" }.toLongOrNull() ?: 0L
                     val mime = parts.getOrElse(2) { "application/octet-stream" }
-                    pendingFile = PendingFile(name, size, mime, ByteArrayOutputStream())
+                    val durationMs = parts.getOrElse(3) { "0" }.toLongOrNull() ?: 0L
+                    pendingFile = PendingFile(name, size, mime, durationMs, ByteArrayOutputStream())
                 }
                 BluetoothProtocol.TYPE_FILE_CHUNK -> {
                     pendingFile?.buffer?.write(frame.payload)
@@ -405,11 +546,14 @@ object BluetoothService {
                 }
                 BluetoothProtocol.TYPE_CALL_REQUEST -> {
                     _callState.value = CallState.Incoming(peerName)
+                    appContext?.let { AudioCallManager.startRinging(it) }
                 }
                 BluetoothProtocol.TYPE_CALL_ACCEPT -> {
+                    AudioCallManager.stopRinging()
                     _callState.value = CallState.InCall(peerName, System.currentTimeMillis())
                 }
                 BluetoothProtocol.TYPE_CALL_REJECT, BluetoothProtocol.TYPE_CALL_END -> {
+                    AudioCallManager.stopRinging()
                     _callState.value = CallState.Idle
                 }
                 BluetoothProtocol.TYPE_AUDIO_CHUNK -> {
@@ -422,27 +566,61 @@ object BluetoothService {
             val file = pendingFile ?: return
             pendingFile = null
             val bytes = file.buffer.toByteArray()
+
             if (file.mime.startsWith("image/")) {
                 val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-                _messages.update {
-                    it + ChatMessage(isMine = false, kind = MessageKind.IMAGE, image = bitmap, fileName = file.name, fileSize = file.size)
-                }
-            } else {
-                val dir = File(appContext?.getExternalFilesDir(null), "received")
-                dir.mkdirs()
+                val dir = File(appContext?.getExternalFilesDir(null), "received").apply { mkdirs() }
                 val outFile = File(dir, file.name)
-                FileOutputStream(outFile).use { it.write(bytes) }
+                try { FileOutputStream(outFile).use { it.write(bytes) } } catch (e: Exception) {}
                 _messages.update {
                     it + ChatMessage(
-                        isMine = false, kind = MessageKind.FILE,
-                        fileName = file.name, fileSize = file.size, filePath = outFile.absolutePath
+                        isMine = false,
+                        kind = MessageKind.IMAGE,
+                        image = bitmap,
+                        fileName = file.name,
+                        fileSize = file.size,
+                        filePath = outFile.absolutePath,
+                        mimeType = file.mime
                     )
                 }
+            } else if (file.mime == "audio/mp4" || file.name.endsWith(".m4a")) {
+                val dir = File(appContext?.getExternalFilesDir(null), "voice_notes").apply { mkdirs() }
+                val outFile = File(dir, file.name)
+                try {
+                    FileOutputStream(outFile).use { it.write(bytes) }
+                    _messages.update {
+                        it + ChatMessage(
+                            isMine = false,
+                            kind = MessageKind.VOICE_NOTE,
+                            fileName = file.name,
+                            fileSize = file.size,
+                            filePath = outFile.absolutePath,
+                            durationMs = file.durationMs,
+                            mimeType = file.mime
+                        )
+                    }
+                } catch (e: Exception) {}
+            } else {
+                val dir = File(appContext?.getExternalFilesDir(null), "received").apply { mkdirs() }
+                val outFile = File(dir, file.name)
+                try {
+                    FileOutputStream(outFile).use { it.write(bytes) }
+                    _messages.update {
+                        it + ChatMessage(
+                            isMine = false,
+                            kind = MessageKind.FILE,
+                            fileName = file.name,
+                            fileSize = file.size,
+                            filePath = outFile.absolutePath,
+                            mimeType = file.mime
+                        )
+                    }
+                } catch (e: Exception) {}
             }
         }
 
         fun sendConnectAccept() {
-            val socketAddress = socket.remoteDevice?.address ?: ""
+            val socketAddress = socket.remoteDevice?.address ?: peerAddress
             BluetoothProtocol.writeFrame(output, BluetoothProtocol.TYPE_CONNECT_ACCEPT, ByteArray(0))
             _connectionState.value = ConnectionState.Connected(peerName, socketAddress)
         }
@@ -460,5 +638,11 @@ object BluetoothService {
         }
     }
 
-    private data class PendingFile(val name: String, val size: Long, val mime: String, val buffer: ByteArrayOutputStream)
+    private data class PendingFile(
+        val name: String,
+        val size: Long,
+        val mime: String,
+        val durationMs: Long,
+        val buffer: ByteArrayOutputStream
+    )
 }

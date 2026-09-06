@@ -24,16 +24,20 @@ jobs:
 
       - name: Build debug APK
         run: |
-          gradle assembleDebug --stacktrace --no-daemon 2>&1 | tee build.log || {
-            echo "### Gradle Build Failed" >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
-            tail -n 120 build.log >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
-            exit 1
-          }
+          set -o pipefail
+          gradle assembleDebug --stacktrace --no-daemon 2>&1 | tee build.log
+
+      - name: Post build log to summary
+        if: always()
+        run: |
+          echo "### Gradle Build Log (tail 250)" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          tail -n 250 build.log >> $GITHUB_STEP_SUMMARY 2>/dev/null || true
+          echo '```' >> $GITHUB_STEP_SUMMARY
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: BTConnect-debug-apk
           path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
